@@ -1,8 +1,9 @@
 import logging
 import os
-import sqlite3
 from datetime import datetime, timedelta
-from pathlib import Path
+from contextlib import contextmanager
+
+import psycopg
 from zoneinfo import ZoneInfo
 
 import discord
@@ -13,7 +14,9 @@ from discord.ext import commands, tasks
 TOKEN = os.getenv("DISCORD_TOKEN")
 DEFAULT_CHANNEL_ID = int(os.getenv("ALARM_CHANNEL_ID", "0"))
 DEFAULT_ROLE_ID = int(os.getenv("ALARM_ROLE_ID", "0"))
-DB_PATH = Path(os.getenv("DATABASE_PATH", "/var/data/karinderya.sqlite3"))
+DATABASE_URL = os.getenv("DATABASE_URL")
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 PHT = ZoneInfo("Asia/Manila")
 ALARM_INTERVAL = 18
@@ -50,30 +53,46 @@ def next_alarm(now: datetime | None = None) -> tuple[datetime, int]:
     raise RuntimeError("Unable to calculate next alarm")
 
 
+@contextmanager
 def database():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("""CREATE TABLE IF NOT EXISTS settings (
-        name TEXT PRIMARY KEY, value TEXT NOT NULL
-    )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS sent (
-        alarm_key TEXT PRIMARY KEY, sent_at TEXT NOT NULL
-    )""")
-    conn.commit()
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Add your Render PostgreSQL connection string."
+        )
 
+    conn = psycopg.connect(DATABASE_URL, connect_timeout=10)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def initialize_database() -> None:
+    with database() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS settings (
+            name TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS sent (
+            alarm_key TEXT PRIMARY KEY,
+            sent_at TEXT NOT NULL
+        )""")
+    logger.info("PostgreSQL database initialized successfully.")
 
 def setting(name: str, fallback: int) -> int:
     with database() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE name=?", (name,)).fetchone()
+        row = conn.execute("SELECT value FROM settings WHERE name=%s", (name,)).fetchone()
     return int(row[0]) if row else fallback
 
 
 def save_setting(name: str, value: int) -> None:
     with database() as conn:
         conn.execute(
-            "INSERT INTO settings(name,value) VALUES(?,?) "
+            "INSERT INTO settings(name,value) VALUES(%s,%s) "
             "ON CONFLICT(name) DO UPDATE SET value=excluded.value",
             (name, str(value)),
         )
@@ -85,13 +104,13 @@ def alarm_key(when: datetime) -> str:
 
 def already_sent(key: str) -> bool:
     with database() as conn:
-        return conn.execute("SELECT 1 FROM sent WHERE alarm_key=?", (key,)).fetchone() is not None
+        return conn.execute("SELECT 1 FROM sent WHERE alarm_key=%s", (key,)).fetchone() is not None
 
 
 def mark_sent(key: str) -> None:
     with database() as conn:
         conn.execute(
-            "INSERT OR IGNORE INTO sent(alarm_key,sent_at) VALUES(?,?)",
+            "INSERT INTO sent(alarm_key,sent_at) VALUES(%s,%s) ON CONFLICT (alarm_key) DO NOTHING",
             (key, datetime.now(PHT).isoformat()),
         )
 
@@ -100,7 +119,7 @@ def sent_today(now: datetime | None = None) -> int:
     now = now or datetime.now(PHT)
     with database() as conn:
         return conn.execute(
-            "SELECT COUNT(*) FROM sent WHERE alarm_key LIKE ?",
+            "SELECT COUNT(*) FROM sent WHERE alarm_key LIKE %s",
             (now.strftime("%Y-%m-%d") + " %",),
         ).fetchone()[0]
 
@@ -226,6 +245,7 @@ async def catch_up_recent_reminder():
 @bot.event
 async def setup_hook():
     try:
+        initialize_database()
         commands_synced = await bot.tree.sync()
         logger.info("Synced %d application commands.", len(commands_synced))
     except discord.HTTPException:
@@ -362,6 +382,8 @@ async def command_error(interaction: discord.Interaction, error: app_commands.Ap
 
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is not set.")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set. Add your Render PostgreSQL connection string.")
 if not DEFAULT_CHANNEL_ID:
     logger.warning("ALARM_CHANNEL_ID is empty; configure a channel with /setchannel.")
 if not DEFAULT_ROLE_ID:
