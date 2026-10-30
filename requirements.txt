@@ -1,1 +1,2 @@
 discord.py>=2.4,<3
+psycopg[binary]>=3.2,<4
