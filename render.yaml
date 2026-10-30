@@ -1,0 +1,15 @@
+services:
+  - type: worker
+    name: karinderya-alarm-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    autoDeploy: true
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: ALARM_CHANNEL_ID
+        sync: false
+      - key: ALARM_ROLE_ID
+        sync: false
