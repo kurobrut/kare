@@ -5,6 +5,7 @@ import threading
 import json
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from zoneinfo import ZoneInfo
@@ -232,9 +233,11 @@ def sent_today(now: datetime | None = None) -> int:
 
 class HealthHandler(BaseHTTPRequestHandler):
 
-    def do_GET(self):
+    def send_health_response(self, include_body=True):
 
-        if self.path not in ("/", "/health"):
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+
+        if path not in ("/", "/health"):
             self.send_response(404)
             self.end_headers()
             return
@@ -248,20 +251,22 @@ class HealthHandler(BaseHTTPRequestHandler):
         body = json.dumps(response).encode("utf-8")
 
         self.send_response(200)
-        self.send_header(
-            "Content-Type",
-            "application/json"
-        )
-        self.send_header(
-            "Content-Length",
-            str(len(body))
-        )
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
-        self.wfile.write(body)
+        if include_body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self.send_health_response(include_body=True)
+
+    def do_HEAD(self):
+        self.send_health_response(include_body=False)
 
     def log_message(self, format, *args):
-        pass
+        logger.info("Health request: %s", format % args)
 
 
 def start_health_server():
