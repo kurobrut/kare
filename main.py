@@ -1,4 +1,3 @@
-
 import logging
 import os
 import threading
@@ -44,6 +43,8 @@ ALARM_COUNT = 80
 CHECK_SECONDS = 5
 CATCH_UP_MINUTES = 10
 
+ACCENT = discord.Colour.from_rgb(238, 137, 177)
+
 
 # =========================================================
 # LOGGING
@@ -58,32 +59,47 @@ logger = logging.getLogger("karinderya_notifier")
 
 
 # =========================================================
-# REMINDER SCHEDULE
+# GLOBAL TIMEZONE SYSTEM
 # =========================================================
 
-# 12:07 AM, 12:25 AM, ... 11:49 PM
+def now_pht() -> datetime:
+    return datetime.now(PHT)
 
-ALARM_MINUTES = tuple(
-    FIRST_ALARM_MINUTE + i * ALARM_INTERVAL
-    for i in range(ALARM_COUNT)
-)
 
-ALARM_INDEX = {
-    minute: i + 1
-    for i, minute in enumerate(ALARM_MINUTES)
-}
+def discord_timestamp(value: datetime, style="F") -> str:
+    """
+    Discord automatically converts Unix timestamps
+    into each member's local timezone.
 
-ACCENT = discord.Colour.from_rgb(238, 137, 177)
+    F = Full date and time
+    f = Short date and time
+    t = Short time
+    T = Long time
+    R = Relative time
+    """
+
+    return f"<t:{int(value.timestamp())}:{style}>"
 
 
 def clock_text(value: datetime) -> str:
     return value.strftime("%I:%M %p").lstrip("0")
 
 
-def next_alarm(now: datetime | None = None):
-    now = now or datetime.now(PHT)
+# =========================================================
+# REMINDER SCHEDULE
+# =========================================================
 
-    midnight = now.replace(
+ALARM_MINUTES = tuple(
+    FIRST_ALARM_MINUTE + i * ALARM_INTERVAL
+    for i in range(ALARM_COUNT)
+)
+
+
+def next_alarm(now: datetime | None = None) -> datetime:
+
+    now = now or now_pht()
+
+    midnight = now.astimezone(PHT).replace(
         hour=0,
         minute=0,
         second=0,
@@ -91,13 +107,15 @@ def next_alarm(now: datetime | None = None):
     )
 
     for day_offset in (0, 1):
+
         day = midnight + timedelta(days=day_offset)
 
-        for index, minute in enumerate(ALARM_MINUTES, 1):
+        for minute in ALARM_MINUTES:
+
             candidate = day + timedelta(minutes=minute)
 
             if candidate > now:
-                return candidate, index
+                return candidate
 
     raise RuntimeError("Unable to calculate next alarm")
 
@@ -181,7 +199,7 @@ def save_setting(name: str, value: int):
 
 
 def alarm_key(when: datetime) -> str:
-    return when.strftime("%Y-%m-%d %H:%M")
+    return when.astimezone(PHT).strftime("%Y-%m-%d %H:%M")
 
 
 def already_sent(key: str) -> bool:
@@ -206,25 +224,9 @@ def mark_sent(key: str):
             """,
             (
                 key,
-                datetime.now(PHT).isoformat()
+                now_pht().isoformat()
             )
         )
-
-
-def sent_today(now: datetime | None = None) -> int:
-
-    now = now or datetime.now(PHT)
-
-    with database() as conn:
-
-        return conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM sent
-            WHERE alarm_key LIKE %s
-            """,
-            (now.strftime("%Y-%m-%d") + " %",)
-        ).fetchone()[0]
 
 
 # =========================================================
@@ -260,10 +262,10 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
 
     def do_GET(self):
-        self.send_health_response(include_body=True)
+        self.send_health_response(True)
 
     def do_HEAD(self):
-        self.send_health_response(include_body=False)
+        self.send_health_response(False)
 
     def log_message(self, format, *args):
         logger.info("Health request: %s", format % args)
@@ -271,35 +273,25 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def start_health_server():
 
-    try:
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler
+    )
 
-        server = ThreadingHTTPServer(
-            ("0.0.0.0", PORT),
-            HealthHandler
-        )
+    server.daemon_threads = True
 
-        server.daemon_threads = True
+    thread = threading.Thread(
+        target=server.serve_forever,
+        daemon=True,
+        name="health-server"
+    )
 
-        thread = threading.Thread(
-            target=server.serve_forever,
-            daemon=True,
-            name="health-server"
-        )
+    thread.start()
 
-        thread.start()
-
-        logger.info(
-            "HTTP health server listening on 0.0.0.0:%s",
-            PORT
-        )
-
-    except Exception:
-
-        logger.exception(
-            "Failed to start HTTP health server."
-        )
-
-        raise
+    logger.info(
+        "HTTP health server listening on 0.0.0.0:%s",
+        PORT
+    )
 
 
 # =========================================================
@@ -308,7 +300,6 @@ def start_health_server():
 
 def alarm_embed(
     when: datetime,
-    number: int,
     *,
     test=False,
     late=False
@@ -316,26 +307,29 @@ def alarm_embed(
 
     if test:
 
-        title = "Notification test"
+        title = "🔔 Reminder test"
+
         description = (
-            "This is a test post. "
-            "The notification channel and role are connected."
+            "This is a test notification. "
+            "The reminder channel and role are connected."
         )
 
     elif late:
 
-        title = "Karinderya reminder · delayed"
+        title = "🍽️ Karinderya reminder · delayed"
+
         description = (
-            "The bot has just restarted, "
-            "so this reminder is being sent late."
+            "The bot restarted shortly after this reminder was due. "
+            "Join when you can."
         )
 
     else:
 
-        title = "Karinderya reminder"
+        title = "🍽️ Karinderya time!"
+
         description = (
-            "It's time to join. "
-            "Please check in when you're ready."
+            "It's time to join the karinderya. "
+            "Drop in when you're ready!"
         )
 
     embed = discord.Embed(
@@ -345,23 +339,19 @@ def alarm_embed(
     )
 
     embed.add_field(
-        name="Scheduled",
-        value=clock_text(when),
-        inline=True
-    )
-
-    embed.add_field(
-        name="Reminder",
-        value=f"{number} of {ALARM_COUNT}" if number else "Test",
-        inline=True
+        name="Scheduled time",
+        value=(
+            f"{discord_timestamp(when, 'F')}\n"
+            f"{discord_timestamp(when, 'R')}"
+        ),
+        inline=False
     )
 
     embed.set_footer(
-        text="Daily reminders · Philippine time"
+        text="Scheduled on Philippine time · shown in your local timezone"
     )
 
     return embed
-
 
 # =========================================================
 # DISCORD BOT
@@ -374,7 +364,7 @@ bot = commands.Bot(
     intents=intents
 )
 
-started_at = datetime.now(PHT)
+started_at = now_pht()
 
 
 # =========================================================
@@ -434,7 +424,6 @@ async def resolve_channel():
 
 async def post_reminder(
     when: datetime,
-    number: int,
     *,
     test=False,
     late=False
@@ -457,11 +446,7 @@ async def post_reminder(
         guild = getattr(channel, "guild", None)
 
         if guild is None:
-
-            logger.error(
-                "The configured channel is not in a server."
-            )
-
+            logger.error("The configured channel is not in a server.")
             return False
 
         role = guild.get_role(role_id)
@@ -469,7 +454,6 @@ async def post_reminder(
         if role is None:
 
             try:
-
                 role = await guild.fetch_role(role_id)
 
             except (
@@ -498,7 +482,6 @@ async def post_reminder(
             content=role.mention if role else None,
             embed=alarm_embed(
                 when,
-                number,
                 test=test,
                 late=late
             ),
@@ -506,9 +489,7 @@ async def post_reminder(
         )
 
         logger.info(
-            "Posted reminder %s/%s for %s",
-            number,
-            ALARM_COUNT,
+            "Posted reminder for %s",
             when.isoformat()
         )
 
@@ -525,7 +506,6 @@ async def post_reminder(
 
 async def deliver_if_due(
     when: datetime,
-    number: int,
     *,
     late=False
 ):
@@ -537,7 +517,6 @@ async def deliver_if_due(
 
     if await post_reminder(
         when,
-        number,
         late=late
     ):
 
@@ -551,20 +530,17 @@ async def deliver_if_due(
 @tasks.loop(seconds=CHECK_SECONDS)
 async def reminder_loop():
 
-    now = datetime.now(PHT)
+    now = now_pht()
 
     minute = now.hour * 60 + now.minute
 
-    number = ALARM_INDEX.get(minute)
-
-    if number is not None:
+    if minute in ALARM_MINUTES:
 
         await deliver_if_due(
             now.replace(
                 second=0,
                 microsecond=0
-            ),
-            number
+            )
         )
 
 
@@ -580,7 +556,7 @@ async def before_reminder_loop():
 
 async def catch_up_recent_reminder():
 
-    now = datetime.now(PHT)
+    now = now_pht()
 
     midnight = now.replace(
         hour=0,
@@ -591,41 +567,27 @@ async def catch_up_recent_reminder():
 
     due = None
 
-    for index in range(
-        len(ALARM_MINUTES) - 1,
-        -1,
-        -1
-    ):
+    for minute in reversed(ALARM_MINUTES):
 
-        candidate = midnight + timedelta(
-            minutes=ALARM_MINUTES[index]
-        )
+        candidate = midnight + timedelta(minutes=minute)
 
         if candidate <= now:
-
-            due = (
-                candidate,
-                index + 1
-            )
-
+            due = candidate
             break
 
     if due is None:
         return
 
-    when, number = due
-
-    delay = now - when
+    delay = now - due
 
     if timedelta(0) <= delay <= timedelta(
         minutes=CATCH_UP_MINUTES
     ):
 
-        if not already_sent(alarm_key(when)):
+        if not already_sent(alarm_key(due)):
 
             await deliver_if_due(
-                when,
-                number,
+                due,
                 late=True
             )
 
@@ -680,16 +642,26 @@ def admin():
 
 @bot.tree.command(
     name="schedule",
-    description="Show today's reminder times."
+    description="Show today's reminder schedule in your local timezone."
 )
 async def schedule_cmd(
     interaction: discord.Interaction
 ):
 
+    now = now_pht()
+
+    midnight = now.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
+
     embed = discord.Embed(
         title="Daily reminder schedule",
         description=(
-            "80 reminders · every 18 minutes · Philippine time"
+            "Every 18 minutes.\n"
+            "All times automatically convert to your local timezone."
         ),
         colour=ACCENT
     )
@@ -698,41 +670,22 @@ async def schedule_cmd(
 
         lines = []
 
-        for index in range(
-            start,
-            min(start + 20, ALARM_COUNT)
-        ):
+        for minute in ALARM_MINUTES[start:start + 20]:
 
-            minute = ALARM_MINUTES[index]
-
-            hour, minute_part = divmod(
-                minute,
-                60
-            )
-
-            stamp = datetime(
-                2000,
-                1,
-                1,
-                hour,
-                minute_part
-            )
+            scheduled = midnight + timedelta(minutes=minute)
 
             lines.append(
-                f"`{index + 1:02}`  {clock_text(stamp)}"
+                f"• {discord_timestamp(scheduled, 'f')}"
             )
 
         embed.add_field(
-            name=(
-                f"Reminders {start + 1}–"
-                f"{min(start + 20, ALARM_COUNT)}"
-            ),
+            name="Schedule",
             value="\n".join(lines),
             inline=True
         )
 
     embed.set_footer(
-        text="First reminder: 12:07 AM · Last reminder: 11:49 PM"
+        text="Original schedule: Philippine time · Display: Your local timezone"
     )
 
     await interaction.response.send_message(
@@ -747,30 +700,13 @@ async def schedule_cmd(
 
 @bot.tree.command(
     name="next",
-    description="See when the next reminder is due."
+    description="See the next reminder in your local timezone."
 )
 async def next_cmd(
     interaction: discord.Interaction
 ):
 
-    when, number = next_alarm()
-
-    seconds = max(
-        0,
-        int(
-            (when - datetime.now(PHT)).total_seconds()
-        )
-    )
-
-    hours, remainder = divmod(
-        seconds,
-        3600
-    )
-
-    minutes, seconds = divmod(
-        remainder,
-        60
-    )
+    when = next_alarm()
 
     embed = discord.Embed(
         title="Next reminder",
@@ -778,20 +714,12 @@ async def next_cmd(
     )
 
     embed.description = (
-        f"**{when.strftime('%A, %B %-d')} · "
-        f"{clock_text(when)} PHT**"
+        f"**Scheduled:** {discord_timestamp(when, 'F')}\n\n"
+        f"**Time remaining:** {discord_timestamp(when, 'R')}"
     )
 
-    embed.add_field(
-        name="Time remaining",
-        value=f"{hours:02}:{minutes:02}:{seconds:02}",
-        inline=True
-    )
-
-    embed.add_field(
-        name="Reminder",
-        value=f"{number}/{ALARM_COUNT}",
-        inline=True
+    embed.set_footer(
+        text="Automatically converted to your local timezone"
     )
 
     await interaction.response.send_message(
@@ -806,29 +734,23 @@ async def next_cmd(
 
 @bot.tree.command(
     name="status",
-    description="Check the notifier and today's delivery count."
+    description="Check the notifier connection and next reminder."
 )
 async def status_cmd(
     interaction: discord.Interaction
 ):
 
-    now = datetime.now(PHT)
+    now = now_pht()
 
-    when, number = next_alarm(now)
+    when = next_alarm(now)
 
     uptime = int(
         (now - started_at).total_seconds()
     )
 
-    hours, rem = divmod(
-        uptime,
-        3600
-    )
+    hours, rem = divmod(uptime, 3600)
 
-    minutes, _ = divmod(
-        rem,
-        60
-    )
+    minutes, _ = divmod(rem, 60)
 
     channel_id = setting(
         "channel_id",
@@ -852,12 +774,6 @@ async def status_cmd(
     )
 
     embed.add_field(
-        name="Today's posts",
-        value=f"{sent_today(now)}/{ALARM_COUNT}",
-        inline=True
-    )
-
-    embed.add_field(
         name="Uptime",
         value=f"{hours}h {minutes}m",
         inline=True
@@ -865,8 +781,8 @@ async def status_cmd(
 
     embed.add_field(
         name="Next reminder",
-        value=f"{clock_text(when)} · #{number}",
-        inline=True
+        value=discord_timestamp(when, "F"),
+        inline=False
     )
 
     embed.add_field(
@@ -882,7 +798,7 @@ async def status_cmd(
     )
 
     embed.set_footer(
-        text="Timezone: Asia/Manila"
+        text="Times automatically convert to each member's timezone"
     )
 
     await interaction.response.send_message(
@@ -909,8 +825,7 @@ async def test_cmd(
     )
 
     success = await post_reminder(
-        datetime.now(PHT),
-        0,
+        now_pht(),
         test=True
     )
 
@@ -1002,9 +917,9 @@ async def help_cmd(
     embed.add_field(
         name="Available to everyone",
         value=(
-            "`/next` — next reminder and countdown\n"
-            "`/schedule` — full daily schedule\n"
-            "`/status` — connection and delivery status\n"
+            "`/next` — next reminder in your local time\n"
+            "`/schedule` — full daily schedule in your local time\n"
+            "`/status` — connection and next reminder\n"
             "`/help` — command list"
         ),
         inline=False
@@ -1108,3 +1023,4 @@ if not DEFAULT_ROLE_ID:
 start_health_server()
 
 bot.run(TOKEN)
+
